@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram File Uploader Bot with URL Shortener — WEBHOOK MODE
+Telegram File Uploader Bot with URL Shortener
 
 Workflow:
 1. User sets API key: /set_api <API_KEY>
@@ -9,55 +9,39 @@ Workflow:
 4. Bot generates worker link
 5. Bot shortens link using user's API key
 6. Bot sends shortened link to user (as reply to user's file)
-
-Webhook:
-- Telegram updates aate hain: https://<WEBHOOK_HOST>/<BOT_TOKEN>
-- PTB ka built-in aiohttp webhook server use hota hai
-- Health check (/, /health, /healthz) ek alag thread par HTTP server se
 """
 
 import os
+import asyncio
 import string
 import random
-import asyncio
 import requests
-from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ---------------- CONFIG ----------------
 load_dotenv()
 
-BOT_TOKEN            = os.getenv("UPLOADER_BOT_TOKEN")
-MONGO_URI            = os.getenv("MONGODB_URI")
-MONGO_DB_NAME        = os.getenv("MONGO_DB_NAME", "viralbox_db")
-STORAGE_CHANNEL_ID   = int(os.getenv("STORAGE_CHANNEL_ID"))
-WORKER_DOMAIN        = os.getenv("WORKER_DOMAIN")
-VIRALBOX_DOMAIN      = os.getenv("VIRALBOX_DOMAIN", "viralbox.in")
-
-# --- Webhook Config ---
-# PORT         : Render / Railway assign karta hai (e.g. 10000)
-#                Webhook server isi port par sunta hai
-# WEBHOOK_HOST : Aapka public HTTPS domain
-#                e.g. https://mybot.onrender.com   (trailing slash MAT rakhein)
-# HEALTH_PORT  : Alag port health check ke liye (default 8000)
-#                Render mein agar sirf ek PORT hai toh HEALTH_PORT = PORT rakhein
-#                aur Render health check path ko /health set karein
-WEBHOOK_PORT   = int(os.getenv("PORT", 10000))
-WEBHOOK_HOST   = os.getenv("WEBHOOK_HOST", "")          # ⚠️  MUST set!
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")        # Recommended
-HEALTH_PORT    = int(os.getenv("HEALTH_PORT", 8000))
+BOT_TOKEN = os.getenv("UPLOADER_BOT_TOKEN")
+MONGO_URI = os.getenv("MONGODB_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "viralbox_db")
+STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID"))
+WORKER_DOMAIN = os.getenv("WORKER_DOMAIN")
+VIRALBOX_DOMAIN = os.getenv("VIRALBOX_DOMAIN", "viralbox.in")
+HEALTH_CHECK_PORT = int(os.getenv("PORT", 8000))
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "")  # aapka public HTTPS domain
 
 # ---------------- MONGODB ----------------
 try:
-    mongo_client  = MongoClient(MONGO_URI)
-    mongo_db      = mongo_client[MONGO_DB_NAME]
-    mappings_col  = mongo_db["mappings"]
-    links_col     = mongo_db["links"]
+    mongo_client = MongoClient(MONGO_URI)
+    mongo_db = mongo_client[MONGO_DB_NAME]
+    mappings_col = mongo_db["mappings"]
+    links_col = mongo_db["links"]
     user_apis_col = mongo_db["user_apis"]
     print(f"✅ Connected to MongoDB: {MONGO_DB_NAME}")
 except PyMongoError as e:
@@ -75,28 +59,31 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
-
+    
     def log_message(self, format, *args):
-        pass  # suppress logs
-
+        # Suppress health check logs
+        pass
 
 def start_health_server():
-    server = HTTPServer(('0.0.0.0', HEALTH_PORT), HealthCheckHandler)
-    print(f"🏥 Health check server running on port {HEALTH_PORT}")
+    server = HTTPServer(('0.0.0.0', HEALTH_CHECK_PORT), HealthCheckHandler)
+    print(f"🏥 Health check server running on port {HEALTH_CHECK_PORT}")
     server.serve_forever()
 
 
 # ---------------- UTIL ----------------
 def generate_mapping_id(length=6):
+    """Generate random alphanumeric mapping ID"""
     chars = string.ascii_letters + string.digits
     return ''.join(random.choices(chars, k=length))
 
 
 def shorten_url(api_key: str, long_url: str) -> str:
+    """Shorten URL using viralbox.in API"""
     try:
-        api_url  = f"https://{VIRALBOX_DOMAIN}/api?api={api_key}&url={long_url}"
+        api_url = f"https://{VIRALBOX_DOMAIN}/api?api={api_key}&url={long_url}"
         response = requests.get(api_url, timeout=10)
-        data     = response.json()
+        data = response.json()
+        
         if data.get("status") == "success":
             return data.get("shortenedUrl", "")
         return ""
@@ -105,11 +92,15 @@ def shorten_url(api_key: str, long_url: str) -> str:
         return ""
 
 
-# ---------------- HANDLERS ----------------
+# ---------------- START HANDLER ----------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user     = update.effective_user
-    user_api = user_apis_col.find_one({"userId": user.id})
-
+    """Handle /start command"""
+    user = update.effective_user
+    user_id = user.id
+    
+    # Check if user has API key set
+    user_api = user_apis_col.find_one({"userId": user_id})
+    
     if user_api and "apiKey" in user_api:
         await update.message.reply_text("📂 Send A Media To Upload !")
     else:
@@ -124,32 +115,42 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(welcome_msg)
 
 
+# ---------------- SET API HANDLER ----------------
 async def set_api_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /set_api <API_KEY> command"""
     user_id = update.effective_user.id
-
+    
     if not context.args:
         await update.message.reply_text(
             "❌ Usage: /set_api <API_KEY>\n\n"
             f"Get your API key from: https://{VIRALBOX_DOMAIN}/member/tools/api"
         )
         return
-
+    
+    api_key = context.args[0]
+    
+    # Save or update API key
     user_apis_col.update_one(
         {"userId": user_id},
-        {"$set": {"userId": user_id, "apiKey": context.args[0]}},
+        {"$set": {"userId": user_id, "apiKey": api_key}},
         upsert=True
     )
+    
     await update.message.reply_text(
         "✅ API Key saved successfully!\n\n"
         "📂 Now send any media to upload!"
     )
 
 
+# ---------------- UPLOAD HANDLER ----------------
 async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id  = update.effective_user.id
-    msg      = update.message
+    """Handle media upload"""
+    user_id = update.effective_user.id
+    msg = update.message
+    
+    # Check if user has API key
     user_api = user_apis_col.find_one({"userId": user_id})
-
+    
     if not user_api or "apiKey" not in user_api:
         await msg.reply_text(
             "⚠️ Please set your API key first!\n\n"
@@ -157,49 +158,51 @@ async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👉 Then send: /set_api <API_KEY>"
         )
         return
-
+    
     api_key = user_api["apiKey"]
-
+    
     try:
-        # 1️⃣  Storage channel mein copy
-        sent_msg      = await msg.copy(chat_id=STORAGE_CHANNEL_ID)
+        # Step 1: Copy file to storage channel
+        sent_msg = await msg.copy(chat_id=STORAGE_CHANNEL_ID)
         stored_msg_id = sent_msg.message_id
-
-        # 2️⃣  Random mapping ID
+        
+        # Step 2: Generate mapping ID
         mapping_id = generate_mapping_id()
-
-        # 3️⃣  MongoDB mein save
+        
+        # Step 3: Save mapping to MongoDB
         mappings_col.insert_one({
-            "mapping":    mapping_id,
+            "mapping": mapping_id,
             "message_id": stored_msg_id
         })
-
-        # 4️⃣  Worker link
+        
+        # Step 4: Generate worker link
         worker_link = f"{WORKER_DOMAIN}/{mapping_id}"
-
-        # 5️⃣  Shorten
+        
+        # Step 5: Shorten URL using user's API key
         short_url = shorten_url(api_key, worker_link)
-
+        
         if not short_url:
             await msg.reply_text(
-                "❌ URL shortening failed!\nPlease check your API key.",
+                "❌ URL shortening failed!\n"
+                "Please check your API key.",
                 reply_to_message_id=msg.message_id
             )
             return
-
-        # 6️⃣  Links save
+        
+        # Step 6: Save links to database
         links_col.insert_one({
-            "longURL":  worker_link,
+            "longURL": worker_link,
             "shortURL": short_url
         })
-
-        # 7️⃣  User ko reply
+        
+        # Step 7: Send only shortened link (as reply to user's file)
         await msg.reply_text(
             short_url,
             reply_to_message_id=msg.message_id
         )
+        
         print(f"✅ Upload complete: {mapping_id} -> {short_url}")
-
+        
     except Exception as e:
         print(f"❌ Upload failed: {e}")
         await msg.reply_text(
@@ -210,65 +213,46 @@ async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- MAIN ----------------
 async def main():
-    # --- Validation ---
-    missing = [v for v, val in {
-        "UPLOADER_BOT_TOKEN": BOT_TOKEN,
-        "MONGODB_URI":        MONGO_URI,
-        "STORAGE_CHANNEL_ID": STORAGE_CHANNEL_ID,
-        "WORKER_DOMAIN":      WORKER_DOMAIN,
-        "WEBHOOK_HOST":       WEBHOOK_HOST,
-    }.items() if not val]
-
-    if missing:
-        raise RuntimeError(f"❌ Missing env vars: {', '.join(missing)}")
-
-    # --- Health check thread (alag port par) ---
-    if HEALTH_PORT != WEBHOOK_PORT:
-        Thread(target=start_health_server, daemon=True).start()
-
-    # --- Application ---
+    """Initialize and run the bot"""
+    if not all([BOT_TOKEN, MONGO_URI, STORAGE_CHANNEL_ID, WORKER_DOMAIN, WEBHOOK_HOST]):
+        raise RuntimeError("❌ Missing required environment variables!")
+    
+    # Start health check server in background thread
+    health_thread = Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    
+    # Build application
     app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start",   start_handler))
+    
+    # Add handlers
+    app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("set_api", set_api_handler))
     app.add_handler(MessageHandler(
-        filters.Document.ALL |
-        filters.PHOTO       |
-        filters.VIDEO       |
-        filters.AUDIO       |
-        filters.VOICE       |
+        filters.Document.ALL | 
+        filters.PHOTO | 
+        filters.VIDEO | 
+        filters.AUDIO | 
+        filters.VOICE |
         filters.VIDEO_NOTE,
         upload_media
     ))
+    
+    print("🤖 Uploader Bot is running...")
+    print(f"📂 Storage Channel: {STORAGE_CHANNEL_ID}")
+    print(f"🌐 Worker Domain: {WORKER_DOMAIN}")
+    print(f"🔗 Shortener: {VIRALBOX_DOMAIN}")
+    print(f"💾 Database: {MONGO_DB_NAME}")
 
-    # --- Webhook URL ---
+    # ---------------- WEBHOOK MODE ----------------
+    # Sirf yeh part badla hai — run_polling() ki jagah run_webhook()
     webhook_url = f"{WEBHOOK_HOST}/{BOT_TOKEN}"
+    print(f"🌍 Webhook URL: {webhook_url}")
 
-    # --- Logs ---
-    print("=" * 52)
-    print("  🤖  Uploader Bot — WEBHOOK MODE")
-    print("=" * 52)
-    print(f"  📂  Storage Channel  : {STORAGE_CHANNEL_ID}")
-    print(f"  🌐  Worker Domain    : {WORKER_DOMAIN}")
-    print(f"  🔗  Shortener        : {VIRALBOX_DOMAIN}")
-    print(f"  💾  Database         : {MONGO_DB_NAME}")
-    print(f"  🌍  Webhook Host     : {WEBHOOK_HOST}")
-    print(f"  🔌  Webhook Port     : {WEBHOOK_PORT}")
-    print(f"  🔗  Webhook URL      : {webhook_url}")
-    print(f"  🏥  Health Port      : {HEALTH_PORT}")
-    if WEBHOOK_SECRET:
-        print(f"  🔐  Webhook Secret   : *** set ***")
-    print("=" * 52)
-
-    # --- run_webhook ---
-    # PTB automatically Telegram par webhook register karta hai
-    # aur ek aiohttp server start karta hai.
     await app.run_webhook(
-        listen       = "0.0.0.0",
-        port         = WEBHOOK_PORT,
-        url_path     = f"/{BOT_TOKEN}",        # local route
-        webhook_url  = webhook_url,            # public URL → Telegram
-        secret_token = WEBHOOK_SECRET or None, # optional security
+        listen      = "0.0.0.0",
+        port        = HEALTH_CHECK_PORT,
+        url_path    = f"/{BOT_TOKEN}",
+        webhook_url = webhook_url,
     )
 
 
