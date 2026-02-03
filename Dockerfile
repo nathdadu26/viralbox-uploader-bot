@@ -6,7 +6,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY uploader.py .
-COPY .env .
+
+# Environment variables should be set in your deployment platform
+# Do not copy .env file - use platform environment variables instead
 
 EXPOSE 8000
 
