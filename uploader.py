@@ -1,137 +1,236 @@
 #!/usr/bin/env python3
 """
-ViralBox Uploader Bot - Modern Version (python-telegram-bot v21+)
-This version removes the deprecated 'before_server_start' parameter
+Telegram File Uploader Bot with URL Shortener
+
+Workflow:
+1. User sets API key: /set_api <API_KEY>
+2. User sends media
+3. Bot uploads to storage channel
+4. Bot generates worker link
+5. Bot shortens link using user's API key
+6. Bot sends shortened link to user (as reply to user's file)
 """
 
 import os
-import logging
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
-from pymongo import MongoClient
 import asyncio
+import string
+import random
+import requests
+from dotenv import load_dotenv
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+from telegram import Update
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ---------------- CONFIG ----------------
+load_dotenv()
 
-# Environment variables
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-MONGO_URI = os.getenv('MONGO_URI')
-WEBHOOK_URL = os.getenv('WEBHOOK_URL')
-PORT = int(os.getenv('PORT', 8000))
-STORAGE_CHANNEL = os.getenv('STORAGE_CHANNEL', '-1003830165800')
-WORKER_DOMAIN = os.getenv('WORKER_DOMAIN', 'https://server.viralboxfiles.workers.dev')
-SHORTENER = os.getenv('SHORTENER', 'viralbox.in')
+BOT_TOKEN = os.getenv("UPLOADER_BOT_TOKEN")
+MONGO_URI = os.getenv("MONGODB_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "viralbox_db")
+STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID"))
+WORKER_DOMAIN = os.getenv("WORKER_DOMAIN")
+VIRALBOX_DOMAIN = os.getenv("VIRALBOX_DOMAIN", "viralbox.in")
+PORT = int(os.getenv("PORT", 8000))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Your Koyeb app URL
 
-# Validate required environment variables
-if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN environment variable is required")
-if not MONGO_URI:
-    raise RuntimeError("❌ MONGO_URI environment variable is required")
-if not WEBHOOK_URL:
-    raise RuntimeError("❌ WEBHOOK_URL environment variable is required")
-
-# Connect to MongoDB
+# ---------------- MONGODB ----------------
 try:
     mongo_client = MongoClient(MONGO_URI)
-    db = mongo_client['viralbox_db']
-    # Test connection
-    mongo_client.admin.command('ping')
-    logger.info(f"✅ Connected to MongoDB: {db.name}")
-except Exception as e:
-    logger.error(f"❌ MongoDB connection failed: {e}")
+    mongo_db = mongo_client[MONGO_DB_NAME]
+    mappings_col = mongo_db["mappings"]
+    links_col = mongo_db["links"]
+    user_apis_col = mongo_db["user_apis"]
+    print(f"✅ Connected to MongoDB: {MONGO_DB_NAME}")
+except PyMongoError as e:
     raise RuntimeError(f"❌ MongoDB connection failed: {e}")
 
-# Print configuration
-logger.info("🤖 Uploader Bot is running...")
-logger.info(f"📂 Storage Channel: {STORAGE_CHANNEL}")
-logger.info(f"🌐 Worker Domain: {WORKER_DOMAIN}")
-logger.info(f"🔗 Shortener: {SHORTENER}")
-logger.info(f"💾 Database: {db.name}")
-logger.info(f"🌍 Webhook URL: {WEBHOOK_URL}")
-logger.info(f"🏥 Health check: port {PORT} (/, /health, /healthz)")
+
+# ---------------- UTIL ----------------
+def generate_mapping_id(length=6):
+    """Generate random alphanumeric mapping ID"""
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.choices(chars, k=length))
 
 
-# Command handlers
-async def start_command(update, context):
-    """Handle /start command"""
-    await update.message.reply_text(
-        "👋 Welcome to ViralBox Uploader Bot!\n\n"
-        "Send me a file and I'll upload it for you."
-    )
-
-
-async def help_command(update, context):
-    """Handle /help command"""
-    await update.message.reply_text(
-        "📖 Help:\n\n"
-        "Just send me any file and I'll process it for you.\n"
-        "Supported commands:\n"
-        "/start - Start the bot\n"
-        "/help - Show this help message"
-    )
-
-
-async def handle_file(update, context):
-    """Handle file uploads"""
+def shorten_url(api_key: str, long_url: str) -> str:
+    """Shorten URL using viralbox.in API"""
     try:
-        # Get the file
-        file = None
-        if update.message.document:
-            file = update.message.document
-        elif update.message.video:
-            file = update.message.video
-        elif update.message.photo:
-            file = update.message.photo[-1]  # Get largest photo
+        api_url = f"https://{VIRALBOX_DOMAIN}/api?api={api_key}&url={long_url}"
+        response = requests.get(api_url, timeout=10)
+        data = response.json()
         
-        if file:
-            await update.message.reply_text("📤 Processing your file...")
-            # Add your file processing logic here
-            # Example: Save to database, upload to storage, etc.
-            logger.info(f"Received file: {getattr(file, 'file_name', 'photo')}")
-        else:
-            await update.message.reply_text("Please send me a valid file.")
+        if data.get("status") == "success":
+            return data.get("shortenedUrl", "")
+        return ""
     except Exception as e:
-        logger.error(f"Error handling file: {e}")
-        await update.message.reply_text("❌ Error processing file. Please try again.")
+        print(f"❌ Shortening failed: {e}")
+        return ""
 
 
-async def health_check(update, context):
-    """Health check endpoint"""
-    await update.message.reply_text("✅ Bot is healthy!")
+# ---------------- START HANDLER ----------------
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user = update.effective_user
+    user_id = user.id
+    
+    # Check if user has API key set
+    user_api = user_apis_col.find_one({"userId": user_id})
+    
+    if user_api and "apiKey" in user_api:
+        await update.message.reply_text("📂 Send A Media To Upload !")
+    else:
+        welcome_msg = (
+            f"👋 Welcome {user.first_name} to {VIRALBOX_DOMAIN} Uploader Bot!\n\n"
+            f"1️⃣ Create an Account on {VIRALBOX_DOMAIN}\n"
+            f"2️⃣ Go To 👉 https://{VIRALBOX_DOMAIN}/member/tools/api\n"
+            f"3️⃣ Copy your API Key\n"
+            f"4️⃣ Send /set_api <API_KEY>\n"
+            f"5️⃣ Send any media to upload !"
+        )
+        await update.message.reply_text(welcome_msg)
 
 
-def main():
-    """Main function to run the bot"""
+# ---------------- SET API HANDLER ----------------
+async def set_api_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /set_api <API_KEY> command"""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: /set_api <API_KEY>\n\n"
+            f"Get your API key from: https://{VIRALBOX_DOMAIN}/member/tools/api"
+        )
+        return
+    
+    api_key = context.args[0]
+    
+    # Save or update API key
+    user_apis_col.update_one(
+        {"userId": user_id},
+        {"$set": {"userId": user_id, "apiKey": api_key}},
+        upsert=True
+    )
+    
+    await update.message.reply_text(
+        "✅ API Key saved successfully!\n\n"
+        "📂 Now send any media to upload!"
+    )
+
+
+# ---------------- UPLOAD HANDLER ----------------
+async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle media upload"""
+    user_id = update.effective_user.id
+    msg = update.message
+    
+    # Check if user has API key
+    user_api = user_apis_col.find_one({"userId": user_id})
+    
+    if not user_api or "apiKey" not in user_api:
+        await msg.reply_text(
+            "⚠️ Please set your API key first!\n\n"
+            f"👉 Get it from: https://{VIRALBOX_DOMAIN}/member/tools/api\n"
+            f"👉 Then send: /set_api <API_KEY>"
+        )
+        return
+    
+    api_key = user_api["apiKey"]
+    
     try:
-        # Create application
-        application = Application.builder().token(BOT_TOKEN).build()
+        # Step 1: Copy file to storage channel
+        sent_msg = await msg.copy(chat_id=STORAGE_CHANNEL_ID)
+        stored_msg_id = sent_msg.message_id
         
-        # Add handlers
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("health", health_check))
-        application.add_handler(MessageHandler(
-            filters.Document.ALL | filters.VIDEO | filters.PHOTO,
-            handle_file
-        ))
+        # Step 2: Generate mapping ID
+        mapping_id = generate_mapping_id()
         
-        # Run with webhook (modern approach - no before_server_start parameter)
-        application.run_webhook(
-            listen='0.0.0.0',
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-            allowed_updates=['message', 'callback_query']
+        # Step 3: Save mapping to MongoDB
+        mappings_col.insert_one({
+            "mapping": mapping_id,
+            "message_id": stored_msg_id
+        })
+        
+        # Step 4: Generate worker link
+        worker_link = f"{WORKER_DOMAIN}/{mapping_id}"
+        
+        # Step 5: Shorten URL using user's API key
+        short_url = shorten_url(api_key, worker_link)
+        
+        if not short_url:
+            await msg.reply_text(
+                "❌ URL shortening failed!\n"
+                "Please check your API key.",
+                reply_to_message_id=msg.message_id
+            )
+            return
+        
+        # Step 6: Save links to database
+        links_col.insert_one({
+            "longURL": worker_link,
+            "shortURL": short_url
+        })
+        
+        # Step 7: Send only shortened link (as reply to user's file)
+        await msg.reply_text(
+            short_url,
+            reply_to_message_id=msg.message_id
         )
         
+        print(f"✅ Upload complete: {mapping_id} -> {short_url}")
+        
     except Exception as e:
-        logger.error(f"❌ Fatal error: {e}")
-        raise
+        print(f"❌ Upload failed: {e}")
+        await msg.reply_text(
+            "❌ Upload failed! Please try again later.",
+            reply_to_message_id=msg.message_id
+        )
 
 
-if __name__ == '__main__':
-    main()
+# ---------------- MAIN ----------------
+def main():
+    """Initialize and run the bot"""
+    if not all([BOT_TOKEN, MONGO_URI, STORAGE_CHANNEL_ID, WORKER_DOMAIN, WEBHOOK_URL]):
+        raise RuntimeError("❌ Missing required environment variables!")
+    
+    # Build application
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("set_api", set_api_handler))
+    app.add_handler(MessageHandler(
+        filters.Document.ALL | 
+        filters.PHOTO | 
+        filters.VIDEO | 
+        filters.AUDIO | 
+        filters.VOICE |
+        filters.VIDEO_NOTE,
+        upload_media
+    ))
+    
+    print("🤖 Uploader Bot is running...")
+    print(f"📂 Storage Channel: {STORAGE_CHANNEL_ID}")
+    print(f"🌐 Worker Domain: {WORKER_DOMAIN}")
+    print(f"🔗 Shortener: {VIRALBOX_DOMAIN}")
+    print(f"💾 Database: {MONGO_DB_NAME}")
+    print(f"🌍 Webhook URL: {WEBHOOK_URL}")
+    print(f"🏥 Health check: port {PORT} (/, /health, /healthz)")
+    
+    # Run webhook
+    app.run_webhook(
+        listen='0.0.0.0',
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+    )
+
+
+# ---------------- ENTRY POINT ----------------
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
