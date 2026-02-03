@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram File Uploader Bot with URL Shortener
+Telegram File Uploader Bot with URL Shortener — WEBHOOK MODE (Koyeb Ready)
 
 Workflow:
 1. User sets API key: /set_api <API_KEY>
@@ -21,8 +21,7 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
-from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from aiohttp import web
 
 # ---------------- CONFIG ----------------
 load_dotenv()
@@ -33,8 +32,8 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "viralbox_db")
 STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID"))
 WORKER_DOMAIN = os.getenv("WORKER_DOMAIN")
 VIRALBOX_DOMAIN = os.getenv("VIRALBOX_DOMAIN", "viralbox.in")
-HEALTH_CHECK_PORT = int(os.getenv("PORT", 8000))
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "")  # aapka public HTTPS domain
+PORT = int(os.getenv("PORT", 8000))
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "")
 
 # ---------------- MONGODB ----------------
 try:
@@ -48,26 +47,13 @@ except PyMongoError as e:
     raise RuntimeError(f"❌ MongoDB connection failed: {e}")
 
 
-# ---------------- HEALTH CHECK SERVER ----------------
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ['/', '/health', '/healthz']:
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'OK')
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def log_message(self, format, *args):
-        # Suppress health check logs
-        pass
-
-def start_health_server():
-    server = HTTPServer(('0.0.0.0', HEALTH_CHECK_PORT), HealthCheckHandler)
-    print(f"🏥 Health check server running on port {HEALTH_CHECK_PORT}")
-    server.serve_forever()
+# ---------------- HEALTH CHECK ----------------
+# Koyeb ek hi port use karta hai — health check aur webhook
+# dono same port par hona chahiye.
+# PTB ka webhook server aiohttp use karta hai — hum usme
+# apne health check routes add kar sakte hain.
+async def health_check(request):
+    return web.Response(text="OK", status=200)
 
 
 # ---------------- UTIL ----------------
@@ -83,7 +69,7 @@ def shorten_url(api_key: str, long_url: str) -> str:
         api_url = f"https://{VIRALBOX_DOMAIN}/api?api={api_key}&url={long_url}"
         response = requests.get(api_url, timeout=10)
         data = response.json()
-        
+
         if data.get("status") == "success":
             return data.get("shortenedUrl", "")
         return ""
@@ -97,10 +83,9 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user = update.effective_user
     user_id = user.id
-    
-    # Check if user has API key set
+
     user_api = user_apis_col.find_one({"userId": user_id})
-    
+
     if user_api and "apiKey" in user_api:
         await update.message.reply_text("📂 Send A Media To Upload !")
     else:
@@ -119,23 +104,22 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_api_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /set_api <API_KEY> command"""
     user_id = update.effective_user.id
-    
+
     if not context.args:
         await update.message.reply_text(
             "❌ Usage: /set_api <API_KEY>\n\n"
             f"Get your API key from: https://{VIRALBOX_DOMAIN}/member/tools/api"
         )
         return
-    
+
     api_key = context.args[0]
-    
-    # Save or update API key
+
     user_apis_col.update_one(
         {"userId": user_id},
         {"$set": {"userId": user_id, "apiKey": api_key}},
         upsert=True
     )
-    
+
     await update.message.reply_text(
         "✅ API Key saved successfully!\n\n"
         "📂 Now send any media to upload!"
@@ -147,10 +131,9 @@ async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle media upload"""
     user_id = update.effective_user.id
     msg = update.message
-    
-    # Check if user has API key
+
     user_api = user_apis_col.find_one({"userId": user_id})
-    
+
     if not user_api or "apiKey" not in user_api:
         await msg.reply_text(
             "⚠️ Please set your API key first!\n\n"
@@ -158,29 +141,29 @@ async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👉 Then send: /set_api <API_KEY>"
         )
         return
-    
+
     api_key = user_api["apiKey"]
-    
+
     try:
         # Step 1: Copy file to storage channel
         sent_msg = await msg.copy(chat_id=STORAGE_CHANNEL_ID)
         stored_msg_id = sent_msg.message_id
-        
+
         # Step 2: Generate mapping ID
         mapping_id = generate_mapping_id()
-        
+
         # Step 3: Save mapping to MongoDB
         mappings_col.insert_one({
             "mapping": mapping_id,
             "message_id": stored_msg_id
         })
-        
+
         # Step 4: Generate worker link
         worker_link = f"{WORKER_DOMAIN}/{mapping_id}"
-        
+
         # Step 5: Shorten URL using user's API key
         short_url = shorten_url(api_key, worker_link)
-        
+
         if not short_url:
             await msg.reply_text(
                 "❌ URL shortening failed!\n"
@@ -188,21 +171,21 @@ async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_to_message_id=msg.message_id
             )
             return
-        
+
         # Step 6: Save links to database
         links_col.insert_one({
             "longURL": worker_link,
             "shortURL": short_url
         })
-        
+
         # Step 7: Send only shortened link (as reply to user's file)
         await msg.reply_text(
             short_url,
             reply_to_message_id=msg.message_id
         )
-        
+
         print(f"✅ Upload complete: {mapping_id} -> {short_url}")
-        
+
     except Exception as e:
         print(f"❌ Upload failed: {e}")
         await msg.reply_text(
@@ -213,47 +196,59 @@ async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- MAIN ----------------
 async def main():
-    """Initialize and run the bot"""
+    """Initialize and run the bot in webhook mode"""
     if not all([BOT_TOKEN, MONGO_URI, STORAGE_CHANNEL_ID, WORKER_DOMAIN, WEBHOOK_HOST]):
         raise RuntimeError("❌ Missing required environment variables!")
-    
-    # Start health check server in background thread
-    health_thread = Thread(target=start_health_server, daemon=True)
-    health_thread.start()
-    
+
     # Build application
     app = Application.builder().token(BOT_TOKEN).build()
-    
+
     # Add handlers
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("set_api", set_api_handler))
     app.add_handler(MessageHandler(
-        filters.Document.ALL | 
-        filters.PHOTO | 
-        filters.VIDEO | 
-        filters.AUDIO | 
+        filters.Document.ALL |
+        filters.PHOTO |
+        filters.VIDEO |
+        filters.AUDIO |
         filters.VOICE |
         filters.VIDEO_NOTE,
         upload_media
     ))
-    
+
+    # Webhook URL
+    webhook_url = f"{WEBHOOK_HOST}/{BOT_TOKEN}"
+
     print("🤖 Uploader Bot is running...")
     print(f"📂 Storage Channel: {STORAGE_CHANNEL_ID}")
     print(f"🌐 Worker Domain: {WORKER_DOMAIN}")
     print(f"🔗 Shortener: {VIRALBOX_DOMAIN}")
     print(f"💾 Database: {MONGO_DB_NAME}")
-
-    # ---------------- WEBHOOK MODE ----------------
-    # Sirf yeh part badla hai — run_polling() ki jagah run_webhook()
-    webhook_url = f"{WEBHOOK_HOST}/{BOT_TOKEN}"
     print(f"🌍 Webhook URL: {webhook_url}")
+    print(f"🏥 Health check: port {PORT} (/, /health, /healthz)")
 
+    # --- run_webhook ---
+    # PTB internally aiohttp server banata hai.
+    # before_server_start callback mein hum health check routes
+    # add kar lete hain usi aiohttp app mein — same port, no conflict.
     await app.run_webhook(
-        listen      = "0.0.0.0",
-        port        = HEALTH_CHECK_PORT,
-        url_path    = f"/{BOT_TOKEN}",
-        webhook_url = webhook_url,
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=f"/{BOT_TOKEN}",
+        webhook_url=webhook_url,
+        before_server_start=register_health_routes,  # <-- health check routes
     )
+
+
+# ---------------- HEALTH ROUTES REGISTER ----------------
+# PTB run_webhook() mein before_server_start callback milta hai
+# jisme (aiohttp_app, aiohttp_runner) milte hain.
+# Hum wahan apne routes add kar lete hain.
+async def register_health_routes(aiohttp_app, runner):
+    aiohttp_app.router.add_get("/", health_check)
+    aiohttp_app.router.add_get("/health", health_check)
+    aiohttp_app.router.add_get("/healthz", health_check)
+    print("🏥 Health check routes registered (/, /health, /healthz)")
 
 
 # ---------------- ENTRY POINT ----------------
