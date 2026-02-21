@@ -107,6 +107,8 @@ def shorten_url(api_key: str, long_url: str) -> str:
 # ---------------- START HANDLER ----------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
+    if not update.effective_user or not update.message:
+        return
     user = update.effective_user
     user_id = user.id
     
@@ -129,6 +131,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- SET API HANDLER ----------------
 async def set_api_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /set_api <API_KEY> command"""
+    if not update.effective_user or not update.message:
+        return
     user_id = update.effective_user.id
     
     if not context.args:
@@ -155,6 +159,12 @@ async def set_api_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- UPLOAD HANDLER ----------------
 async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle media upload"""
+    # Channel posts, anonymous updates aur storage channel ke messages ignore karo
+    if not update.effective_user or not update.message:
+        return
+    if update.effective_chat and update.effective_chat.id == STORAGE_CHANNEL_ID:
+        return
+
     user_id = update.effective_user.id
     msg = update.message
     
@@ -227,13 +237,17 @@ def main():
     
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("set_api", set_api_handler))
+    # Storage channel ke messages handler level pe hi block karo
+    not_storage = ~filters.Chat(STORAGE_CHANNEL_ID)
     app.add_handler(MessageHandler(
-        filters.Document.ALL | 
-        filters.PHOTO | 
-        filters.VIDEO | 
-        filters.AUDIO | 
-        filters.VOICE |
-        filters.VIDEO_NOTE,
+        not_storage & (
+            filters.Document.ALL | 
+            filters.PHOTO | 
+            filters.VIDEO | 
+            filters.AUDIO | 
+            filters.VOICE |
+            filters.VIDEO_NOTE
+        ),
         upload_media
     ))
     
