@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram File Uploader Bot with URL Shortener
+Optimized for Koyeb Free Tier (Cold Start Friendly)
 
 Workflow:
 1. User sets API key: /set_api <API_KEY>
@@ -16,6 +17,8 @@ import asyncio
 import string
 import random
 import requests
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -34,16 +37,49 @@ VIRALBOX_DOMAIN = os.getenv("VIRALBOX_DOMAIN", "viralbox.in")
 PORT = int(os.getenv("PORT", 8000))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Your Koyeb app URL
 
-# ---------------- MONGODB ----------------
-try:
-    mongo_client = MongoClient(MONGO_URI)
-    mongo_db = mongo_client[MONGO_DB_NAME]
-    mappings_col = mongo_db["mappings"]
-    links_col = mongo_db["links"]
-    user_apis_col = mongo_db["user_apis"]
-    print(f"✅ Connected to MongoDB: {MONGO_DB_NAME}")
-except PyMongoError as e:
-    raise RuntimeError(f"❌ MongoDB connection failed: {e}")
+# ---------------- MONGODB (Lazy Connection) ----------------
+# Lazy init - connection sirf tab hogi jab pehli baar use ho
+_mongo_client = None
+_mongo_db = None
+
+def get_db():
+    """Lazy MongoDB connection - cold start me fast boot ke liye"""
+    global _mongo_client, _mongo_db
+    if _mongo_client is None:
+        try:
+            _mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+            _mongo_db = _mongo_client[MONGO_DB_NAME]
+            print(f"✅ Connected to MongoDB: {MONGO_DB_NAME}")
+        except PyMongoError as e:
+            raise RuntimeError(f"❌ MongoDB connection failed: {e}")
+    return _mongo_db
+
+def get_col(name):
+    return get_db()[name]
+
+
+# ---------------- HEALTH CHECK SERVER ----------------
+# Yeh lightweight HTTP server Koyeb ko batata hai ki app alive hai
+# Isse Koyeb container ko "healthy" samajhta hai aur webhook kaam karta hai
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # Health check logs suppress karo (noisy hote hain)
+
+def run_health_server():
+    """Background thread me health check server chalao"""
+    # Koyeb ka PORT environment variable use karta hai health check ke liye
+    # python-telegram-bot apna port alag use karta hai
+    health_port = int(os.getenv("HEALTH_PORT", 8080))
+    server = HTTPServer(("0.0.0.0", health_port), HealthHandler)
+    print(f"🏥 Health check server: port {health_port}")
+    server.serve_forever()
 
 
 # ---------------- UTIL ----------------
@@ -74,8 +110,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     
-    # Check if user has API key set
-    user_api = user_apis_col.find_one({"userId": user_id})
+    user_api = get_col("user_apis").find_one({"userId": user_id})
     
     if user_api and "apiKey" in user_api:
         await update.message.reply_text("📂 Send A Media To Upload !")
@@ -105,8 +140,7 @@ async def set_api_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     api_key = context.args[0]
     
-    # Save or update API key
-    user_apis_col.update_one(
+    get_col("user_apis").update_one(
         {"userId": user_id},
         {"$set": {"userId": user_id, "apiKey": api_key}},
         upsert=True
@@ -124,8 +158,7 @@ async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     msg = update.message
     
-    # Check if user has API key
-    user_api = user_apis_col.find_one({"userId": user_id})
+    user_api = get_col("user_apis").find_one({"userId": user_id})
     
     if not user_api or "apiKey" not in user_api:
         await msg.reply_text(
@@ -138,23 +171,17 @@ async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api_key = user_api["apiKey"]
     
     try:
-        # Step 1: Copy file to storage channel
         sent_msg = await msg.copy(chat_id=STORAGE_CHANNEL_ID)
         stored_msg_id = sent_msg.message_id
         
-        # Step 2: Generate mapping ID
         mapping_id = generate_mapping_id()
         
-        # Step 3: Save mapping to MongoDB
-        mappings_col.insert_one({
+        get_col("mappings").insert_one({
             "mapping": mapping_id,
             "message_id": stored_msg_id
         })
         
-        # Step 4: Generate worker link
         worker_link = f"{WORKER_DOMAIN}/{mapping_id}"
-        
-        # Step 5: Shorten URL using user's API key
         short_url = shorten_url(api_key, worker_link)
         
         if not short_url:
@@ -165,13 +192,11 @@ async def upload_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Step 6: Save links to database
-        links_col.insert_one({
+        get_col("links").insert_one({
             "longURL": worker_link,
             "shortURL": short_url
         })
         
-        # Step 7: Send only shortened link (as reply to user's file)
         await msg.reply_text(
             short_url,
             reply_to_message_id=msg.message_id
@@ -192,11 +217,14 @@ def main():
     """Initialize and run the bot"""
     if not all([BOT_TOKEN, MONGO_URI, STORAGE_CHANNEL_ID, WORKER_DOMAIN, WEBHOOK_URL]):
         raise RuntimeError("❌ Missing required environment variables!")
-    
-    # Build application
+
+    # Health check server background me start karo
+    # Yeh Koyeb ko signal deta hai ki container ready hai
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("set_api", set_api_handler))
     app.add_handler(MessageHandler(
@@ -215,9 +243,10 @@ def main():
     print(f"🔗 Shortener: {VIRALBOX_DOMAIN}")
     print(f"💾 Database: {MONGO_DB_NAME}")
     print(f"🌍 Webhook URL: {WEBHOOK_URL}")
-    print(f"🏥 Health check: port {PORT} (/, /health, /healthz)")
     
-    # Run webhook
+    # Webhook mode - Cold start ke liye best approach
+    # Telegram request aate hi container wake up hota hai
+    # aur python-telegram-bot apna aserver khud handle karta hai
     app.run_webhook(
         listen='0.0.0.0',
         port=PORT,
